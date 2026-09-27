@@ -2,7 +2,7 @@
 
 ## Overview
 
-This solution performs **Business Entity Resolution** by matching records from two source datasets (SOURCE2, SOURCE3) against a reference/master dataset (SOURCE1). The pipeline uses PySpark for scalable data processing with a blocking + scoring approach to efficiently resolve entities across millions of records.
+This solution performs **Business Entity Resolution** by matching records from two source datasets (SOURCE2, SOURCE3) against a reference/master dataset (SOURCE1). The pipeline uses PySpark for scalable data processing with a **multi-pass blocking** + **multi-signal scoring** approach to efficiently resolve entities across millions of records.
 
 ## Architecture
 
@@ -17,22 +17,25 @@ This solution performs **Business Entity Resolution** by matching records from t
                     │
             ┌───────▼───────┐
             │  Normalization │  ← uppercase, strip punctuation,
-            │  & Cleaning    │    remove legal suffixes
+            │  & Cleaning    │    remove legal suffixes, tokenize
+            └───────┬───────┘
+                    │
+            ┌───────▼────────────────────────────┐
+            │  Multi-Pass Blocking               │
+            │                                    │
+            │  Pass 1: core_name + country       │
+            │  Pass 2: prefix(5) + city + country│
+            │  Pass 3: core_name + city          │
+            └───────┬────────────────────────────┘
+                    │
+            ┌───────▼───────┐
+            │   Scoring      │  ← Levenshtein + Jaccard +
+            │   (6 signals)  │    address + binary features
             └───────┬───────┘
                     │
             ┌───────▼───────┐
-            │   Blocking     │  ← core_name | city | country
-            │                │    reduces comparisons
-            └───────┬───────┘
-                    │
-            ┌───────▼───────┐
-            │   Scoring      │  ← Levenshtein similarity,
-            │   & Ranking    │    weighted feature scoring
-            └───────┬───────┘
-                    │
-            ┌───────▼───────┐
-            │   Best Match   │  ← top-1 per source entity
-            │   Selection    │
+            │   Threshold    │  ← score ≥ 0.45
+            │   & Ranking    │    top-1 per source entity
             └───────┬───────┘
                     │
         ┌───────────▼───────────┐
@@ -67,49 +70,45 @@ Each dataset must contain the following columns:
 - **Whitespace** — collapse multiple spaces, trim leading/trailing
 - **Punctuation** — strip all non-alphanumeric characters
 - **Case** — convert to uppercase for consistent comparison
-- **Legal suffixes** — remove common suffixes:
-  `PRIVATE LIMITED`, `PVT LTD`, `PVT LIMITED`, `LIMITED`, `LTD`, `INCORPORATED`, `INC`, `CORPORATION`, `CORP`, `COMPANY`, `CO`, `LLC`
+- **Legal suffixes** — remove common suffixes (English, German, French, Spanish, Dutch, Malaysian, Japanese, Finnish, Swedish, Turkish):
+  `PRIVATE LIMITED`, `PVT LTD`, `LIMITED`, `LTD`, `INC`, `CORP`, `LLC`, `LLP`, `PLC`, `GMBH`, `AG`, `SA`, `SAS`, `NV`, `BV`, `PTY LTD`, `SDN BHD`, `KK`, `OY`, `AB`, `AS`, etc.
+- **Tokenization** — split core name into word tokens for Jaccard similarity
+- **Prefix extraction** — first 5 characters of core name for loose blocking
 
 ### 2. City Extraction
 
-Extracts the city from the `business_address` field by taking the last comma-separated component (conservative heuristic).
+Extracts the city from `business_address` by taking the last comma-separated component. If that component looks like a zip/postal code (all digits), falls back to the second-to-last component.
 
-### 3. Blocking (Candidate Generation)
+### 3. Multi-Pass Blocking (Candidate Generation)
 
-Generates a composite **block key** from:
+Three blocking passes with different key strategies, unioned and deduplicated:
 
-```
-core_name | city | country
-```
+| Pass | Block Key                          | Catches                                     |
+|------|------------------------------------|----------------------------------------------|
+| 1    | `core_name` + `country`            | City typos, missing city data                |
+| 2    | `name_prefix(5)` + `city` + `country` | Core name typos sharing the same prefix  |
+| 3    | `core_name` + `city`              | Country mismatches, multinational entities    |
 
-Only pairs that share the same block key are compared, dramatically reducing the $O(n^2)$ comparison space. Records with empty core_name, city, or country are excluded from blocking.
+### 4. Similarity Scoring (6 Signals)
 
-### 4. Similarity Scoring
-
-For each candidate pair the system computes:
-
-| Feature             | Weight | Method                   |
-|---------------------|--------|--------------------------|
-| `name_similarity`   | 0.70   | Levenshtein distance     |
-| `core_match`        | 0.15   | Exact equality           |
-| `city_match`        | 0.10   | Exact equality           |
-| `country_match`     | 0.05   | Exact equality           |
-
-**Name similarity** is calculated as:
-
-$$
-\text{similarity} = 1 - \frac{\text{levenshtein}(s, m)}{\max(\lvert s \rvert, \lvert m \rvert)}
-$$
+| Feature              | Weight | Method                                      |
+|----------------------|--------|----------------------------------------------|
+| `name_similarity`    | 0.35   | Levenshtein distance (character-level)       |
+| `jaccard_similarity` | 0.25   | Jaccard index on word tokens                 |
+| `core_match`         | 0.15   | Exact equality of core names                 |
+| `address_similarity` | 0.10   | Levenshtein distance on cleaned addresses    |
+| `city_match`         | 0.10   | Exact equality of cities                     |
+| `country_match`      | 0.05   | Exact equality of countries                  |
 
 **Final score:**
 
-$$
-\text{score} = 0.70 \times \text{name\_similarity} + 0.15 \times \text{core\_match} + 0.10 \times \text{city\_match} + 0.05 \times \text{country\_match}
-$$
+$$\text{score} = 0.35 \times \text{name\_sim} + 0.25 \times \text{jaccard} + 0.15 \times \text{core} + 0.10 \times \text{addr\_sim} + 0.10 \times \text{city} + 0.05 \times \text{country}$$
 
 ### 5. Best Match Selection
 
-For each source entity, candidates are ranked by `match_score` (descending), with `name_similarity` as a tiebreaker. The top-1 candidate is selected as the final match.
+- Candidates ranked by `match_score` → `name_similarity` → `jaccard_similarity` (descending)
+- Top-1 candidate per source entity
+- Minimum threshold of **0.45** applied to prevent false positives
 
 ## How to Reproduce
 
@@ -136,34 +135,19 @@ python src/run.py \
 
 ### Output
 
-The pipeline produces two files in the output directory:
-
 | File                    | Description                                      |
 |-------------------------|--------------------------------------------------|
 | `matching_results.tsv`  | Final best matches (upload to leaderboard)       |
 | `candidate_pairs.tsv`   | All blocking candidate pairs before scoring      |
 
-### Output Columns (`matching_results.tsv`)
-
-| Column                     | Description                            |
-|----------------------------|----------------------------------------|
-| `source`                   | Source label (`SOURCE2` / `SOURCE3`)   |
-| `source_entity_id`         | Entity ID from the source dataset      |
-| `source_business_name`     | Original business name from source     |
-| `source_business_address`  | Original address from source           |
-| `source_country`           | Country from source                    |
-| `matched_entity_id`        | Best-matched entity ID from SOURCE1    |
-| `matched_business_name`    | Business name from SOURCE1             |
-| `matched_business_address` | Address from SOURCE1                   |
-| `name_similarity`          | Levenshtein-based name similarity      |
-| `match_score`              | Weighted composite match score         |
+Both are written as proper single-file TSVs (not Spark part-file directories).
 
 ## Spark Configuration
 
-| Parameter                            | Value     |
-|--------------------------------------|-----------|
-| `spark.driver.memory`                | `8g`      |
-| `spark.sql.shuffle.partitions`       | `200`     |
+| Parameter                              | Value   |
+|----------------------------------------|---------|
+| `spark.driver.memory`                  | `8g`    |
+| `spark.sql.shuffle.partitions`         | `200`   |
 | `spark.sql.autoBroadcastJoinThreshold` | `50m`   |
 
 ## Project Structure
